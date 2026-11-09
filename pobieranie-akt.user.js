@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Portal Przeglądania Akt – pobieranie dokumentów (nieoficjalny)
 // @namespace    https://github.com/Czekoloczek/prokuratura-akta
-// @version      1.0.0
-// @description  Nieoficjalny dodatek do Portalu Przeglądania Akt prokuratury: pobiera otwarty dokument jako PDF albo całe akta jako ZIP z PDF-ami i spisem dokumentów.
+// @version      1.1.0
+// @description  Nieoficjalny dodatek do Portalu Przeglądania Akt prokuratury: pobiera otwarty dokument albo całe akta – jako PDF lub obrazy (PNG, JPEG, WebP), w archiwum ZIP, TAR albo TAR.GZ, ze spisem dokumentów.
 // @author       Czekoloczek
 // @license      GPL-3.0-or-later
 // @homepageURL  https://github.com/Czekoloczek/prokuratura-akta
@@ -322,41 +322,138 @@
     return [time, date];
   }
 
-  /** ZIP bez kompresji (PDF-y z JPEG-ami i tak się nie kompresują), nazwy w UTF-8. */
-  class ZipBuilder {
-    constructor() { this.parts = []; this.central = []; this.size = 0; this.count = 0; }
+  /** Kompresja „deflate-raw” (dla ZIP-a); null, gdy środowisko jej nie obsługuje. */
+  async function deflateRaw(data) {
+    let cs;
+    try { cs = new CompressionStream('deflate-raw'); } catch (e) { return null; }
+    const blob = data instanceof Blob ? data : new Blob([data]);
+    return new Response(blob.stream().pipeThrough(cs)).blob();
+  }
 
-    /** data: Blob | Uint8Array; size i crc muszą odpowiadać danym. */
-    add(name, data, size, crc, date = new Date()) {
+  async function gzipBlob(blob) {
+    return new Response(blob.stream().pipeThrough(new CompressionStream('gzip'))).blob();
+  }
+
+  const byteSize = (x) => (x instanceof Blob ? x.size : x.length);
+
+  /** ZIP z nazwami w UTF-8; z kompresją Deflate albo bez (PDF-y i PNG i tak są już skompresowane). */
+  class ZipBuilder {
+    constructor({ deflate = false } = {}) {
+      this.deflate = deflate; this.parts = []; this.central = []; this.size = 0; this.count = 0;
+    }
+
+    /** data: Blob | Uint8Array; size i crc dotyczą danych przed kompresją. */
+    async add(name, data, size, crc, date = new Date()) {
+      let payload = data, stored = size, method = 0;
+      if (this.deflate && size > 0) {
+        const packed = await deflateRaw(data);
+        if (packed && packed.size < size) { payload = packed; stored = packed.size; method = 8; }
+      }
       const nameBytes = utf8.encode(name);
       const [time, day] = dosDateTime(date);
       const h = new DataView(new ArrayBuffer(30));
       h.setUint32(0, 0x04034b50, true); h.setUint16(4, 20, true); h.setUint16(6, 0x0800, true);
-      h.setUint16(8, 0, true); h.setUint16(10, time, true); h.setUint16(12, day, true);
-      h.setUint32(14, crc, true); h.setUint32(18, size, true); h.setUint32(22, size, true);
+      h.setUint16(8, method, true); h.setUint16(10, time, true); h.setUint16(12, day, true);
+      h.setUint32(14, crc, true); h.setUint32(18, stored, true); h.setUint32(22, size, true);
       h.setUint16(26, nameBytes.length, true); h.setUint16(28, 0, true);
-      this.parts.push(new Uint8Array(h.buffer), nameBytes, data);
+      this.parts.push(new Uint8Array(h.buffer), nameBytes, payload);
       const c = new DataView(new ArrayBuffer(46));
       c.setUint32(0, 0x02014b50, true); c.setUint16(4, 0x0314, true); c.setUint16(6, 20, true);
-      c.setUint16(8, 0x0800, true); c.setUint16(10, 0, true); c.setUint16(12, time, true);
-      c.setUint16(14, day, true); c.setUint32(16, crc, true); c.setUint32(20, size, true);
+      c.setUint16(8, 0x0800, true); c.setUint16(10, method, true); c.setUint16(12, time, true);
+      c.setUint16(14, day, true); c.setUint32(16, crc, true); c.setUint32(20, stored, true);
       c.setUint32(24, size, true); c.setUint16(28, nameBytes.length, true);
       c.setUint32(38, (0o100644 << 16) >>> 0, true);
       c.setUint32(42, this.size, true);
       this.central.push(new Uint8Array(c.buffer), nameBytes);
-      this.size += 30 + nameBytes.length + size;
+      this.size += 30 + nameBytes.length + stored;
       this.count++;
     }
 
-    addBytes(name, bytes, date) { this.add(name, bytes, bytes.length, crc32(bytes), date); }
+    addBytes(name, bytes, date) { return this.add(name, bytes, bytes.length, crc32(bytes), date); }
 
-    finish() {
+    async finish() {
       const cdSize = this.central.reduce((a, b) => a + b.length, 0);
       const e = new DataView(new ArrayBuffer(22));
       e.setUint32(0, 0x06054b50, true); e.setUint16(8, this.count, true); e.setUint16(10, this.count, true);
       e.setUint32(12, cdSize, true); e.setUint32(16, this.size, true);
       return new Blob([...this.parts, ...this.central, new Uint8Array(e.buffer)], { type: 'application/zip' });
     }
+  }
+
+  /** Rekord rozszerzonego nagłówka PAX: „<długość> klucz=wartość\n” (długość liczy także samą siebie). */
+  function paxRecord(key, value) {
+    const body = utf8.encode(` ${key}=${value}\n`).length;
+    let len = body + 1;
+    while (String(len).length + body !== len) len = String(len).length + body;
+    return `${len} ${key}=${value}\n`;
+  }
+
+  /** TAR (ustar); długie albo nie-ASCII nazwy przez nagłówek PAX. Z gzip = TAR.GZ. */
+  class TarBuilder {
+    constructor({ gzip = false } = {}) { this.gzip = gzip; this.parts = []; this.size = 0; this.count = 0; }
+
+    push(x) { this.parts.push(x); this.size += byteSize(x); }
+
+    padTo512(n) { const r = n % 512; if (r) this.push(new Uint8Array(512 - r)); }
+
+    header(name, size, mtime, type) {
+      const h = new Uint8Array(512);
+      const put = (bytes, off, len) => h.set(bytes.subarray(0, len), off);
+      const oct = (n, off, len) => put(ascii(`${n.toString(8).padStart(len - 1, '0')}\0`), off, len);
+      put(utf8.encode(name), 0, 100);
+      oct(0o644, 100, 8); oct(0, 108, 8); oct(0, 116, 8);
+      oct(size, 124, 12); oct(Math.floor(mtime / 1000), 136, 12);
+      h.fill(0x20, 148, 156);
+      h[156] = type.charCodeAt(0);
+      put(ascii('ustar\0'), 257, 6); put(ascii('00'), 263, 2);
+      let sum = 0;
+      for (let i = 0; i < 512; i++) sum += h[i];
+      put(ascii(`${sum.toString(8).padStart(6, '0')}\0 `), 148, 8);
+      return h;
+    }
+
+    async add(name, data, size, crc, date = new Date()) {
+      const mtime = date.getTime();
+      let headerName = name;
+      if (!/^[\x20-\x7e]*$/.test(name) || utf8.encode(name).length > 100) {
+        const pax = utf8.encode(paxRecord('path', name));
+        const base = name.split('/').pop().replace(/[^\x20-\x7e]/g, '_').slice(0, 80);
+        this.push(this.header(`PaxHeader/${base}`, pax.length, mtime, 'x'));
+        this.push(pax);
+        this.padTo512(pax.length);
+        headerName = name.replace(/[^\x20-\x7e]/g, '_');
+        if (headerName.length > 100) headerName = headerName.slice(-100);
+      }
+      this.push(this.header(headerName, size, mtime, '0'));
+      this.push(data);
+      this.padTo512(size);
+      this.count++;
+    }
+
+    addBytes(name, bytes, date) { return this.add(name, bytes, bytes.length, 0, date); }
+
+    async finish() {
+      this.push(new Uint8Array(1024));
+      const tar = new Blob(this.parts, { type: 'application/x-tar' });
+      return this.gzip ? new Blob([await gzipBlob(tar)], { type: 'application/gzip' }) : tar;
+    }
+  }
+
+  /** Formaty archiwum do wyboru w ustawieniach. */
+  const ARCHIVES = {
+    zip: { label: 'ZIP', ext: '.zip', create: () => new ZipBuilder() },
+    'zip-deflate': { label: 'ZIP z kompresją', ext: '.zip', packs: true, create: () => new ZipBuilder({ deflate: true }) },
+    tar: { label: 'TAR', ext: '.tar', create: () => new TarBuilder() },
+    'tar.gz': { label: 'TAR.GZ', ext: '.tar.gz', packs: true, create: () => new TarBuilder({ gzip: true }) },
+  };
+
+  const MIME_OF = { png: 'image/png', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp' };
+  const EXT_OF = { png: '.png', jpeg: '.jpg', gif: '.gif', webp: '.webp', bmp: '.bmp', tiff: '.tif' };
+
+  /** Nazwa pliku strony: „k. 012.png”, „k. 012v.png”; bez numerów kart – „strona 001.png”. */
+  function pageFileName(label, index, width, ext) {
+    const m = label && /^k\. (\d+)(v?)$/.exec(label);
+    return m ? `k. ${m[1].padStart(width, '0')}${m[2]}${ext}` : `strona ${String(index + 1).padStart(width, '0')}${ext}`;
   }
 
   /* -------------------- nazwy plików i spis -------------------- */
@@ -419,7 +516,8 @@
 
   const core = {
     crc32, sniff, parseJpeg, parsePng, pngToPdfImage, toPdfImage, pageSize, pdfText, PdfBuilder,
-    ZipBuilder, safeName, padIndex, cardRange, stripHtml, csv, cardPages, deflate,
+    ZipBuilder, TarBuilder, ARCHIVES, paxRecord, pageFileName, safeName, padIndex, cardRange, stripHtml, csv,
+    cardPages, deflate,
   };
 
   // W Node (testy) eksportujemy rdzeń i kończymy.
@@ -590,9 +688,9 @@
     }, signal);
   }
 
-  /** Obraz nietypowego formatu → surowe piksele (przez canvas) → Flate. */
-  async function rasterize(bytes, kind) {
-    const blob = new Blob([bytes], { type: ['gif', 'webp', 'bmp'].includes(kind) ? `image/${kind}` : '' });
+  /** Obraz (dowolny format obsługiwany przez przeglądarkę) → canvas na białym tle. */
+  async function drawToCanvas(bytes, kind) {
+    const blob = new Blob([bytes], { type: MIME_OF[kind] || '' });
     let source, cleanup = () => {};
     try {
       source = await createImageBitmap(blob);
@@ -618,7 +716,14 @@
     ctx.fillRect(0, 0, w, h);
     ctx.drawImage(source, 0, 0);
     cleanup();
-    const px = ctx.getImageData(0, 0, w, h).data;
+    return canvas;
+  }
+
+  /** Obraz nietypowego formatu → surowe piksele → Flate (do PDF-a, bez strat). */
+  async function rasterize(bytes, kind) {
+    const canvas = await drawToCanvas(bytes, kind);
+    const w = canvas.width, h = canvas.height;
+    const px = canvas.getContext('2d').getImageData(0, 0, w, h).data;
     canvas.width = canvas.height = 0;
     let gray = true;
     for (let i = 0; i < px.length; i += 4) {
@@ -633,6 +738,44 @@
       width: w, height: h, bpc: 8, colorSpace: gray ? '/DeviceGray' : '/DeviceRGB',
       filter: 'FlateDecode', data: [await deflate(raw)], dpi: null,
     };
+  }
+
+  let canvasOk = null;
+
+  /**
+   * Czy odczyt pikseli z canvas jest wierny. Firefox z ochroną przed fingerprintingiem
+   * (np. privacy.resistFingerprinting) blokuje go albo dodaje szum – konwersja dałaby wtedy
+   * puste lub zaszumione strony.
+   */
+  function canvasReadbackOk() {
+    try {
+      const c = document.createElement('canvas');
+      c.width = c.height = 8;
+      const ctx = c.getContext('2d');
+      ctx.fillStyle = 'rgb(200, 30, 60)';
+      ctx.fillRect(0, 0, 8, 8);
+      const d = ctx.getImageData(0, 0, 8, 8).data;
+      for (let i = 0; i < d.length; i += 4) {
+        if (d[i] !== 200 || d[i + 1] !== 30 || d[i + 2] !== 60 || d[i + 3] !== 255) return false;
+      }
+      return true;
+    } catch (e) { return false; }
+  }
+
+  /** Konwersja strony do JPEG/WebP przez canvas przeglądarki. quality: 30–100. */
+  async function convertImage(bytes, kind, mime, quality) {
+    if (canvasOk === null) canvasOk = canvasReadbackOk();
+    if (!canvasOk) {
+      throw new Fatal('Przeglądarka blokuje albo zaszumia odczyt obrazów z canvas (ochrona przed śledzeniem), ' +
+        'więc konwersja zepsułaby strony. Wybierz format „oryginalne skany” (PDF albo PNG).');
+    }
+    const canvas = await drawToCanvas(bytes, kind);
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, mime, quality / 100));
+    canvas.width = canvas.height = 0;
+    if (!blob || blob.type !== mime) {
+      throw new Fatal(`Ta przeglądarka nie potrafi zapisywać obrazów ${mime.replace('image/', '').toUpperCase()}.`);
+    }
+    return new Uint8Array(await blob.arrayBuffer());
   }
 
   /* -------------------- dane z portalu -------------------- */
@@ -715,10 +858,11 @@
         const range = cardRange(n);
         const idx = n.index != null && n.index !== '' ? `${padIndex(n.index, width)}. ` : '';
         const stem = safeName(`${idx}${n.name || 'dokument'}${range ? ` (${range})` : ''}`, 140);
-        const file = unique(folder, stem, '.pdf');
-        docs.push({ node: n, folder, file, crumbs, label: nodeLabel(n) });
+        // Nazwa bez rozszerzenia: dokument to „<nazwa>.pdf” albo folder „<nazwa>/” ze stronami.
+        const name = unique(folder, stem, '');
+        docs.push({ node: n, folder, stem: name, crumbs, label: nodeLabel(n) });
         if (kids.length) {
-          const sub = folder.concat(safeName(`${stem.replace(/\.pdf$/, '')} – załączniki`, 140));
+          const sub = folder.concat(safeName(`${name} – załączniki`, 140));
           kids.forEach((k) => walk(k, sub, crumbs.concat(nodeLabel(n))));
         }
       } else if (kind === 'ba') {
@@ -806,16 +950,60 @@
     return `${Math.max(1, Math.round(n / 1024))} kB`;
   }
 
-  /* -------------------- budowa PDF-a dokumentu -------------------- */
+  /* -------------------- formaty i ustawienia -------------------- */
+
+  const FORMATS = {
+    pdf: { label: 'PDF – oryginalne skany (zalecane)', short: 'PDF', pdf: true,
+      hint: 'Bez strat i zwykle najmniejszy: strony z portalu trafiają do PDF-a bajt w bajt.' },
+    png: { label: 'PNG – oryginalne skany, plik na stronę', short: 'PNG',
+      hint: 'Bez strat: dokładnie te pliki, które wysyła portal.' },
+    'pdf-jpeg': { label: 'PDF ze stronami w JPEG (stratnie)', short: 'PDF', pdf: true, mime: 'image/jpeg' },
+    jpeg: { label: 'JPEG – plik na stronę (stratnie)', short: 'JPEG', mime: 'image/jpeg', ext: '.jpg' },
+    webp: { label: 'WebP – plik na stronę (stratnie)', short: 'WebP', mime: 'image/webp', ext: '.webp' },
+  };
+  const LOSSY_HINT = 'Skany z portalu to PNG z 16 kolorami – JPEG i WebP wychodzą z nich 2–3 razy większe ' +
+    '(np. WebP 80 ok. 2×, JPEG 80 ok. 3×), a przy niskiej jakości tracą ostrość. Wybierz je tylko, gdy program nie czyta PNG.';
+  const PACK_HINT = 'PDF-y i obrazy są już skompresowane, więc kompresja archiwum zmniejszy je najwyżej o kilka procent.';
+  const SETTINGS_KEY = 'akta-pobieranie-ustawienia';
+  const DEFAULTS = { format: 'pdf', quality: 80, archive: 'zip' };
+
+  function loadSettings() {
+    try {
+      const s = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}');
+      return {
+        format: FORMATS[s.format] ? s.format : DEFAULTS.format,
+        quality: Number.isFinite(s.quality) ? Math.min(100, Math.max(30, s.quality)) : DEFAULTS.quality,
+        archive: ARCHIVES[s.archive] ? s.archive : DEFAULTS.archive,
+      };
+    } catch (e) { return { ...DEFAULTS }; }
+  }
+
+  function saveSettings(s) {
+    try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); } catch (e) { /* nic */ }
+  }
+
+  /** Opis wyniku przy przyciskach, np. „→ plik PDF”, „→ TAR.GZ: folder na dokument, PNG na stronę”. */
+  function describeOutput(s, whole) {
+    const f = FORMATS[s.format], a = ARCHIVES[s.archive];
+    if (!whole) return f.pdf ? '→ plik PDF' : `→ ${a.label} z plikami ${f.short}`;
+    return f.pdf ? `→ ${a.label}: PDF na dokument i spis` : `→ ${a.label}: folder na dokument, ${f.short} na stronę, spis`;
+  }
+
+  /* -------------------- budowa dokumentu w wybranym formacie -------------------- */
 
   /**
-   * Pobiera strony dokumentu i składa PDF. Strony idą równolegle (wg Pacera),
-   * ale do PDF-a trafiają w kolejności kart.
+   * Pobiera strony dokumentu i składa wynik w wybranym formacie. Strony idą równolegle
+   * (wg Pacera), ale do wyniku trafiają w kolejności kart.
+   * Zwraca { pdf, pages, size, exclusions } albo { files: [{ name, bytes, crc }], pages, size, exclusions }.
    */
-  async function buildDocumentPdf(cards, meta, signal, onPage) {
+  async function buildDocumentOutput(cards, meta, settings, signal, onPage) {
+    const fmt = FORMATS[settings.format];
     const pages = cardPages(cards, meta.firstCard, meta.lastCard);
     if (!pages.length) throw new Error('Dokument nie ma stron do pobrania.');
-    const pdf = new PdfBuilder();
+    const pdf = fmt.pdf ? new PdfBuilder() : null;
+    const maxNo = Math.max(0, ...pages.map((p) => Number((/\d+/.exec(p.label || '') || [0])[0])));
+    const width = Math.max(3, String(maxNo).length, String(pages.length).length);
+    const files = [];
     const ready = new Array(pages.length);
     let next = 0, done = 0;
     const inner = new AbortController();
@@ -824,9 +1012,17 @@
     try {
       await Promise.all(pages.map((pg, i) => (async () => {
         const res = await fetchBinary(pageUrl(pg.key), inner.signal);
-        ready[i] = await toPdfImage(res.bytes, rasterize);
+        const kind = sniff(res.bytes);
+        if (kind === 'html') throw new HtmlInsteadOfImage('Serwer zwrócił stronę HTML zamiast obrazu.');
+        let bytes = res.bytes, ext = EXT_OF[kind] || '.bin';
+        if (fmt.mime) {
+          bytes = await convertImage(res.bytes, kind, fmt.mime, settings.quality);
+          ext = fmt.ext || '.jpg';
+        }
+        ready[i] = pdf ? await toPdfImage(bytes, rasterize) : { name: pageFileName(pg.label, i, width, ext), bytes };
         while (next < pages.length && ready[next]) {
-          pdf.addPage(ready[next], pages[next].label);
+          if (pdf) pdf.addPage(ready[next], pages[next].label);
+          else files.push(Object.assign(ready[next], { crc: crc32(ready[next].bytes) }));
           ready[next] = null;
           next++;
         }
@@ -839,113 +1035,279 @@
     } finally {
       signal.removeEventListener('abort', onOuter);
     }
-    const exclusions = pages.map((p) => p.card.exclusionInfo).filter(Boolean).map(stripHtml);
-    return Object.assign(pdf.finish(meta), { exclusions: [...new Set(exclusions)] });
+    const exclusions = [...new Set(pages.map((p) => p.card.exclusionInfo).filter(Boolean).map(stripHtml))];
+    if (pdf) {
+      const out = pdf.finish(meta);
+      return { pdf: out, pages: out.pages, size: out.size, exclusions };
+    }
+    return { files, pages: files.length, size: files.reduce((a, f) => a + f.bytes.length, 0), exclusions };
+  }
+
+  /** Dokłada wynik dokumentu do archiwum; zwraca ścieżkę (plik PDF albo folder ze stronami). */
+  async function addToArchive(archive, base, out, date) {
+    if (out.pdf) {
+      await archive.add(`${base}.pdf`, new Blob(out.pdf.chunks, { type: 'application/pdf' }), out.pdf.size, out.pdf.crc, date);
+      return `${base}.pdf`;
+    }
+    for (const f of out.files) await archive.add(`${base}/${f.name}`, f.bytes, f.bytes.length, f.crc, date);
+    return `${base}/`;
   }
 
   /* -------------------- interfejs -------------------- */
 
   const CSS = `
     :host { all: initial; }
-    .box { font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif; color: #17212b;
-      background: #fff; border: 1px solid #9fb0c2; border-radius: 10px; width: 310px; overflow: hidden;
-      box-shadow: 0 6px 24px rgba(0, 0, 0, .2); }
-    .head { display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: #123f73; color: #fff;
-      font-weight: 600; cursor: pointer; user-select: none; }
-    .head:focus-visible { outline: 3px solid #ffbf47; outline-offset: -3px; }
-    .head .title { flex: 1; }
-    .body { padding: 10px 12px 12px; display: grid; gap: 8px; }
-    .collapsed .body { display: none; }
-    .box.collapsed { width: auto; }
-    button { font: inherit; border-radius: 6px; padding: 7px 10px; cursor: pointer; text-align: left;
+    .pop { box-sizing: border-box; width: 340px; max-width: calc(100vw - 16px); padding: 10px 12px 12px;
+      display: grid; gap: 6px; font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+      color: #17212b; background: #fff; border: 1px solid #9fb0c2; border-radius: 8px;
+      box-shadow: 0 8px 28px rgba(0, 0, 0, .22); }
+    .top { display: flex; align-items: center; gap: 8px; }
+    .title { flex: 1; font-weight: 600; color: #123f73; }
+    .x { font: inherit; font-size: 16px; line-height: 1; border: 0; background: none; color: #4a5866;
+      padding: 4px 6px; border-radius: 4px; cursor: pointer; }
+    .x:hover { background: #e8eef5; }
+    button.main { font: inherit; text-align: left; padding: 7px 10px; border-radius: 6px; cursor: pointer;
       border: 1px solid #123f73; background: #123f73; color: #fff; }
-    button:hover:not(:disabled) { background: #0b2c52; }
-    button:focus-visible { outline: 3px solid #ffbf47; outline-offset: 1px; }
-    button.secondary { background: #fff; color: #123f73; }
-    button.secondary:hover:not(:disabled) { background: #e8eef5; }
+    button.main:hover:not(:disabled) { background: #0b2c52; }
+    button.secondary { font: inherit; padding: 6px 10px; border-radius: 6px; cursor: pointer;
+      border: 1px solid #123f73; background: #fff; color: #123f73; }
+    button.secondary:hover { background: #e8eef5; }
+    button:focus-visible, select:focus-visible, input:focus-visible { outline: 3px solid #ffbf47; outline-offset: 1px; }
     button:disabled { opacity: .45; cursor: default; }
-    .current { font-size: 12px; color: #4a5866; margin-top: -4px; overflow: hidden; text-overflow: ellipsis;
-      white-space: nowrap; }
-    progress { width: 100%; height: 12px; accent-color: #123f73; }
+    .sub { font-size: 12px; color: #4a5866; margin: -3px 0 2px; }
+    .sub span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .opts { display: grid; gap: 6px; border-top: 1px solid #dde4ec; padding-top: 8px; margin-top: 2px; }
+    .opts label { display: grid; gap: 2px; font-size: 12px; color: #4a5866; }
+    select { font: inherit; font-size: 13px; color: #17212b; background: #fff; padding: 4px 6px;
+      border: 1px solid #9fb0c2; border-radius: 4px; }
+    input[type=range] { width: 100%; margin: 0; accent-color: #123f73; }
+    .hint { margin: 0; font-size: 12px; color: #4a5866; }
+    .hint:empty { display: none; }
+    progress { width: 100%; height: 10px; accent-color: #123f73; }
     .status { font-size: 13px; white-space: pre-wrap; word-break: break-word; max-height: 160px; overflow: auto; }
     .status:empty { display: none; }
     .status .warn { color: #7a3b00; font-weight: 600; }
     [hidden] { display: none !important; }
   `;
 
+  const EDGE_CSS = `
+    :host { all: initial; }
+    button { position: fixed; right: 0; top: 40%; writing-mode: vertical-rl; transform: rotate(180deg);
+      font: 600 12px/1 system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif; color: #fff;
+      background: #123f73; border: 0; border-radius: 0 6px 6px 0; padding: 10px 5px; cursor: pointer; opacity: .8; }
+    button:hover, button:focus-visible { opacity: 1; }
+    button:focus-visible { outline: 3px solid #ffbf47; }
+  `;
+
+  const TB_ID = 'akta-pobieranie-przycisk';
+  const DV_ID = 'akta-pobieranie-dokument';
+  const IDLE_TEXT = 'Pobierz akta';
+
   function createUi() {
+    let settings = loadSettings();
+    let anchor = null, side = 'below', controller = null, keepAlive = null, triggerText = IDLE_TEXT;
+    let tbFailures = 0;
+    const startedAt = Date.now();
+
+    /* dymek */
     const host = document.createElement('div');
     host.setAttribute('data-akta-pobieranie', '');
-    host.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:2147483000;';
+    host.style.cssText = 'position:fixed;top:0;left:0;z-index:2147483000;display:none;';
     const root = host.attachShadow({ mode: 'open' });
     root.innerHTML = `<style>${CSS}</style>
-      <div class="box">
-        <div class="head" role="button" tabindex="0" aria-expanded="true" title="Kliknij, aby zwinąć lub rozwinąć">
-          <span aria-hidden="true">⬇</span><span class="title">Pobieranie akt</span><span class="tog" aria-hidden="true">▾</span>
+      <div class="pop" role="dialog" aria-label="Pobieranie akt">
+        <div class="top"><span class="title">Pobieranie akt</span>
+          <button class="x" type="button" aria-label="Zamknij" title="Zamknij (Esc)">✕</button></div>
+        <button class="b-doc main" type="button">Pobierz otwarty dokument</button>
+        <div class="sub"><span class="cur"></span><span class="o-doc"></span></div>
+        <button class="b-all main" type="button">Pobierz całe akta</button>
+        <div class="sub"><span class="o-all"></span></div>
+        <div class="opts">
+          <label>Format plików <select class="f-format"></select></label>
+          <label class="q-row"><span>Jakość: <b class="q-val"></b></span>
+            <input class="f-quality" type="range" min="30" max="100" step="5"></label>
+          <label>Archiwum <select class="f-archive"></select></label>
+          <p class="hint"></p>
         </div>
-        <div class="body">
-          <button class="b-doc" type="button">Pobierz otwarty dokument (PDF)</button>
-          <div class="current"></div>
-          <button class="b-all" type="button">Pobierz całe akta (ZIP z PDF-ami)</button>
-          <progress class="prog" max="1" value="0" hidden></progress>
-          <div class="status" role="status" aria-live="polite"></div>
-          <button class="b-stop secondary" type="button" hidden>Przerwij</button>
-        </div>
+        <progress class="prog" max="1" value="0" hidden></progress>
+        <div class="status" role="status" aria-live="polite"></div>
+        <button class="b-stop secondary" type="button" hidden>Przerwij</button>
       </div>`;
     document.body.appendChild(host);
+    const $ = (s) => root.querySelector(s);
+    const pop = $('.pop'), bDoc = $('.b-doc'), bAll = $('.b-all'), bStop = $('.b-stop');
+    const fFormat = $('.f-format'), fQuality = $('.f-quality'), fArchive = $('.f-archive');
+    const prog = $('.prog'), status = $('.status');
+    for (const [k, f] of Object.entries(FORMATS)) fFormat.add(new Option(f.label, k));
+    for (const [k, a] of Object.entries(ARCHIVES)) fArchive.add(new Option(a.label, k));
+    if (!routeUrl('loadTreeNodes')) { bAll.hidden = true; $('.o-all').hidden = true; }
 
-    const $ = (sel) => root.querySelector(sel);
-    const box = $('.box'), head = $('.head'), bDoc = $('.b-doc'), bAll = $('.b-all'), bStop = $('.b-stop');
-    const prog = $('.prog'), status = $('.status'), current = $('.current');
-
-    const setCollapsed = (c) => {
-      box.classList.toggle('collapsed', c);
-      head.setAttribute('aria-expanded', String(!c));
-      $('.tog').textContent = c ? '▸' : '▾';
-      try { localStorage.setItem('akta-pobieranie-zwiniete', c ? '1' : '0'); } catch (e) { /* nic */ }
+    const render = () => {
+      const f = FORMATS[settings.format];
+      fFormat.value = settings.format;
+      fArchive.value = settings.archive;
+      fQuality.value = settings.quality;
+      $('.q-val').textContent = settings.quality;
+      $('.q-row').hidden = !f.mime;
+      $('.hint').textContent = [f.mime ? LOSSY_HINT : f.hint, ARCHIVES[settings.archive].packs ? PACK_HINT : '']
+        .filter(Boolean).join(' ');
+      $('.o-doc').textContent = describeOutput(settings, false);
+      $('.o-all').textContent = describeOutput(settings, true);
     };
-    try { setCollapsed(localStorage.getItem('akta-pobieranie-zwiniete') === '1'); } catch (e) { /* nic */ }
-    head.addEventListener('click', () => setCollapsed(!box.classList.contains('collapsed')));
-    head.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); head.click(); }
-    });
+    const update = () => {
+      settings = { format: fFormat.value, quality: Number(fQuality.value), archive: fArchive.value };
+      saveSettings(settings);
+      render();
+    };
+    fFormat.addEventListener('change', update);
+    fArchive.addEventListener('change', update);
+    fQuality.addEventListener('input', update);
+    render();
 
-    if (!routeUrl('loadTreeNodes')) bAll.hidden = true;
+    const isOpen = () => host.style.display !== 'none';
+    const place = () => {
+      if (!isOpen()) return;
+      const vw = document.documentElement.clientWidth, vh = window.innerHeight;
+      const w = pop.offsetWidth, h = pop.offsetHeight;
+      const a = anchor && anchor.isConnected ? anchor.getBoundingClientRect() : null;
+      let x, y;
+      if (!a) { x = vw - w - 16; y = vh - h - 16; }
+      else if (side === 'left') { x = a.left - w - 8; y = a.top + a.height / 2 - h / 2; }
+      else {
+        x = Math.min(a.left, vw - w - 8);
+        y = a.bottom + 6;
+        if (y + h > vh - 8 && a.top - 6 - h >= 8) y = a.top - 6 - h;
+      }
+      host.style.left = `${Math.round(Math.max(8, Math.min(x, vw - w - 8)))}px`;
+      host.style.top = `${Math.round(Math.max(8, Math.min(y, vh - h - 8)))}px`;
+    };
+    const open = (el, where = 'below') => {
+      if (el) { anchor = el; side = where; }
+      host.style.display = 'block';
+      place();
+    };
+    const close = () => { host.style.display = 'none'; };
+    const toggle = (el, where) => (isOpen() && anchor === el ? close() : open(el, where));
 
-    let controller = null, keepAlive = null;
+    $('.x').addEventListener('click', () => { close(); anchor && anchor.focus && anchor.focus(); });
+    document.addEventListener('pointerdown', (e) => {
+      if (!isOpen()) return;
+      const path = e.composedPath();
+      if (path.includes(host) || (anchor && path.includes(anchor))) return;
+      close();
+    }, true);
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && isOpen()) { close(); anchor && anchor.focus && anchor.focus(); }
+    }, true);
+    window.addEventListener('resize', place);
+    window.addEventListener('scroll', () => requestAnimationFrame(place), { passive: true, capture: true });
+
+    /* przyciski wbudowane w portal */
+    const setTriggerText = (text) => {
+      triggerText = text;
+      try {
+        const el = document.getElementById(TB_ID);
+        const btn = el && W.DevExpress && W.DevExpress.ui.dxButton.getInstance(el);
+        if (btn && btn.option('text') !== text) btn.option('text', text);
+      } catch (e) { /* nic */ }
+      edgeBtn.textContent = text === IDLE_TEXT ? '⬇ Pobierz akta' : `⬇ ${text}`;
+    };
+
+    /** Przycisk w pasku nad drzewem akt (dxToolbar portalu), zaraz po „Przejdź do wniosku”. */
+    const ensureToolbarButton = () => {
+      if (document.getElementById(TB_ID)) { tbFailures = 0; return true; }
+      if (tbFailures >= 3) return false;
+      try {
+        const el = W.jQuery && W.jQuery('#toolbar');
+        if (!el || !el.length || el.attr('hidden') != null || !el.is(':visible')) return false;
+        const tb = W.DevExpress.ui.dxToolbar.getInstance(el[0]);
+        if (!tb) return false;
+        const items = (tb.option('items') || []).filter((it) => !(it && it.akta));
+        items.splice(Math.min(1, items.length), 0, {
+          akta: true, location: 'before', widget: 'dxButton',
+          options: {
+            type: 'default', stylingMode: 'outlined', icon: 'download', text: triggerText,
+            hint: 'Pobierz otwarty dokument albo całe akta',
+            elementAttr: { id: TB_ID, 'aria-haspopup': 'dialog' },
+            onClick: () => toggle(document.getElementById(TB_ID), 'below'),
+          },
+        });
+        tb.option('items', items);
+      } catch (e) { log('pasek narzędzi', e); }
+      if (document.getElementById(TB_ID)) return true;
+      tbFailures++;
+      return false;
+    };
+
+    /** Ikona w pasku przeglądarki dokumentu, obok trybu pełnoekranowego: od razu pobiera otwarty dokument. */
+    const ensureViewerButton = () => {
+      if (document.getElementById(DV_ID)) return;
+      const fs = document.querySelector('.btn-fullscreen-mode');
+      if (!fs || !fs.parentNode || !W.jQuery || !W.jQuery.fn.dxButton) return;
+      const el = document.createElement('div');
+      el.id = DV_ID;
+      fs.parentNode.insertBefore(el, fs);
+      W.jQuery(el).dxButton({
+        icon: 'download', stylingMode: 'text', hint: 'Pobierz ten dokument',
+        elementAttr: { 'aria-label': 'Pobierz ten dokument' },
+        onClick: () => { open(el, 'below'); downloadCurrent(ui); },
+      });
+    };
+
+    /** Zapas: wąska zakładka przy prawej krawędzi, gdy portal nie pokazuje paska nad drzewem. */
+    const edgeHost = document.createElement('div');
+    edgeHost.setAttribute('data-akta-pobieranie-krawedz', '');
+    edgeHost.hidden = true;
+    const edgeRoot = edgeHost.attachShadow({ mode: 'open' });
+    edgeRoot.innerHTML = `<style>${EDGE_CSS}</style><button type="button" aria-haspopup="dialog"></button>`;
+    const edgeBtn = edgeRoot.querySelector('button');
+    edgeBtn.addEventListener('click', () => toggle(edgeHost, 'left'));
+    document.body.appendChild(edgeHost);
+
     const ui = {
       get busy() { return !!controller; },
+      get settings() { return { ...settings }; },
+      open,
       begin(text) {
         controller = new AbortController();
-        bDoc.disabled = bAll.disabled = true;
+        bDoc.disabled = bAll.disabled = fFormat.disabled = fQuality.disabled = fArchive.disabled = true;
         bStop.hidden = false;
-        prog.hidden = false; prog.removeAttribute('value');
+        prog.hidden = false;
+        prog.removeAttribute('value');
         status.textContent = text || '';
-        setCollapsed(false);
+        setTriggerText('Pobieranie…');
         keepAlive = setInterval(keepSessionAlive, 60 * 1000);
+        place();
         return controller.signal;
       },
       end() {
         controller = null;
         clearInterval(keepAlive);
-        bDoc.disabled = bAll.disabled = false;
+        bDoc.disabled = bAll.disabled = fFormat.disabled = fQuality.disabled = fArchive.disabled = false;
         bStop.hidden = true;
         prog.hidden = true;
+        setTriggerText(IDLE_TEXT);
+        place();
       },
-      progress(value, max) { prog.max = Math.max(1, max); prog.value = value; },
-      say(text) { status.textContent = text; },
+      progress(value, max) {
+        prog.max = Math.max(1, max);
+        prog.value = value;
+        setTriggerText(`Pobieranie ${Math.floor((100 * value) / Math.max(1, max))}%`);
+      },
+      say(text) { status.textContent = text; place(); },
       warn(text) {
         const p = document.createElement('div');
         p.className = 'warn';
         p.textContent = `⚠ ${text}`;
         status.appendChild(p);
         status.scrollTop = status.scrollHeight;
+        place();
       },
       sayWithWarnings(text, warnings) {
         status.textContent = text;
         warnings.forEach((w) => ui.warn(w));
+        place();
       },
-      setCurrent(text) { current.textContent = text; current.title = text; },
     };
 
     bStop.addEventListener('click', () => controller && controller.abort());
@@ -955,16 +1317,24 @@
       if (ui.busy) { e.preventDefault(); e.returnValue = ''; }
     });
 
-    let lastDocKey = null;
-    setInterval(() => {
+    let lastDocKey;
+    const tick = () => {
       const doc = W.documentViewer && W.documentViewer.currentDocument;
       const key = doc ? `${doc.key || doc.id}|${doc.version ? doc.version.id : ''}` : null;
-      if (key === lastDocKey) return;
-      lastDocKey = key;
-      bDoc.title = '';
-      ui.setCurrent(doc ? `Otwarty: ${nodeLabel(Object.assign({ key: doc.key || 'd:' + doc.id }, doc))}` : 'Żaden dokument nie jest otwarty.');
-    }, 1000);
-
+      if (key !== lastDocKey) {
+        lastDocKey = key;
+        const cur = $('.cur');
+        cur.textContent = doc ? `Otwarty: ${nodeLabel(Object.assign({ key: doc.key || `d:${doc.id}` }, doc))}`
+          : 'Żaden dokument nie jest otwarty.';
+        cur.title = cur.textContent;
+      }
+      const inToolbar = ensureToolbarButton();
+      ensureViewerButton();
+      edgeHost.hidden = inToolbar || Date.now() - startedAt < 3000;
+    };
+    setTriggerText(IDLE_TEXT);
+    tick();
+    setInterval(tick, 1000);
     return ui;
   }
 
@@ -977,24 +1347,34 @@
     if (ui.busy) return;
     const dv = W.documentViewer, doc = dv && dv.currentDocument;
     if (!doc || !(doc.id > 0)) {
-      ui.say('Najpierw otwórz dokument (dwuklik w drzewie akt), a potem kliknij „Pobierz otwarty dokument”.');
+      ui.say('Najpierw otwórz dokument (dwuklik w drzewie akt).');
       return;
     }
+    const settings = ui.settings;
     const signal = ui.begin('Pobieranie listy kart…');
     try {
       const info = Object.assign({ key: doc.key || `d:${doc.id}` }, treeNodeData(doc.key) || {}, doc);
       const cards = Array.isArray(doc.cards) && doc.cards.length ? doc.cards : await fetchCards(doc, signal);
       const range = cardRange(info);
-      const label = nodeLabel(info);
       const sprawa = caseName(null);
-      const pdf = await buildDocumentPdf(cards,
-        { title: label, subject: sprawa, firstCard: info.firstCard, lastCard: info.lastCard }, signal,
+      const stem = safeName(`${info.index != null && info.index !== '' ? `${info.index}. ` : ''}` +
+        `${info.name || 'dokument'}${range ? ` (${range})` : ''}`, 140);
+      const out = await buildDocumentOutput(cards,
+        { title: nodeLabel(info), subject: sprawa, firstCard: info.firstCard, lastCard: info.lastCard }, settings, signal,
         (d, t) => { ui.progress(d, t); ui.say(`Strona ${d} z ${t}…`); });
-      const file = safeName(`${sprawa} – ${info.index != null && info.index !== '' ? `${info.index}. ` : ''}` +
-        `${info.name || 'dokument'}${range ? ` (${range})` : ''}`, 180) + '.pdf';
-      saveBlob(new Blob(pdf.chunks, { type: 'application/pdf' }), file);
-      ui.sayWithWarnings(`Gotowe: ${pdf.pages} str., ${fmtBytes(pdf.size)}.\nPlik: ${file}`,
-        pdf.exclusions.map((x) => `Wyłączenia w dokumencie: ${x}`));
+      let file;
+      if (out.pdf) {
+        file = `${safeName(`${sprawa} – ${stem}`, 180)}.pdf`;
+        saveBlob(new Blob(out.pdf.chunks, { type: 'application/pdf' }), file);
+      } else {
+        const a = ARCHIVES[settings.archive], archive = a.create();
+        ui.say('Pakowanie…');
+        await addToArchive(archive, stem, out, new Date());
+        file = `${safeName(`${sprawa} – ${stem}`, 180)}${a.ext}`;
+        saveBlob(await archive.finish(), file);
+      }
+      ui.sayWithWarnings(`Gotowe: ${out.pages} str., ${fmtBytes(out.size)}.\nPlik: ${file}`,
+        out.exclusions.map((x) => `Wyłączenia w dokumencie: ${x}`));
     } catch (e) {
       log(e);
       ui.say('');
@@ -1006,17 +1386,21 @@
 
   async function downloadAll(ui) {
     if (ui.busy) return;
+    const settings = ui.settings;
+    const A = ARCHIVES[settings.archive];
     const signal = ui.begin('Wczytywanie spisu akt…');
     const startedAt = new Date();
-    let zip = new ZipBuilder(), part = 1, savedParts = [], top = 'akta';
-    const rows = [['Lp.', 'Miejsce w aktach', 'Dokument', 'Karty', 'Stron w PDF', 'Plik', 'Uwagi']];
+    let archive = A.create(), part = 1, top = 'akta';
+    const savedParts = [];
+    const rows = [['Lp.', 'Miejsce w aktach', 'Dokument', 'Karty', 'Stron', 'Plik', 'Uwagi']];
     const warnings = [];
     let pagesTotal = 0, okDocs = 0, bytesTotal = 0;
 
-    const saveZip = (suffix) => {
-      zip.addBytes(`${top}/spis-dokumentow.csv`, utf8.encode(csv(rows)), startedAt);
-      const name = `${top}${suffix || ''}.zip`;
-      saveBlob(zip.finish(), name);
+    const saveArchive = async (suffix) => {
+      ui.say('Pakowanie…');
+      await archive.addBytes(`${top}/spis-dokumentow.csv`, utf8.encode(csv(rows)), startedAt);
+      const name = `${top}${suffix || ''}${A.ext}`;
+      saveBlob(await archive.finish(), name);
       savedParts.push(name);
     };
 
@@ -1030,23 +1414,23 @@
       for (let i = 0; i < plan.docs.length; i++) {
         const item = plan.docs[i], n = item.node;
         const where = item.crumbs.join(' › ');
-        const path = [top, ...item.folder, item.file].join('/');
+        const base = [top, ...item.folder, item.stem].join('/');
         ui.progress(i, plan.docs.length);
         ui.say(`Dokument ${i + 1} z ${plan.docs.length}: ${item.label}`);
         try {
           const cards = await fetchCards({ id: idOf(n.key) }, signal);
-          const pdf = await buildDocumentPdf(cards,
-            { title: item.label, subject: top, firstCard: n.firstCard, lastCard: n.lastCard }, signal,
+          const out = await buildDocumentOutput(cards,
+            { title: item.label, subject: top, firstCard: n.firstCard, lastCard: n.lastCard }, settings, signal,
             (d, t) => ui.say(`Dokument ${i + 1} z ${plan.docs.length}: ${item.label}\nStrona ${d} z ${t}`));
-          if (zip.count && zip.size + pdf.size > CFG.zipPartBytes) {
-            saveZip(` (część ${part})`);
-            zip = new ZipBuilder();
+          if (archive.count && archive.size + out.size > CFG.zipPartBytes) {
+            await saveArchive(` (część ${part})`);
+            archive = A.create();
             part++;
           }
-          zip.add(path, new Blob(pdf.chunks, { type: 'application/pdf' }), pdf.size, pdf.crc, startedAt);
-          pagesTotal += pdf.pages; bytesTotal += pdf.size; okDocs++;
-          rows.push([i + 1, where, item.label, cardRange(n), pdf.pages, path.slice(top.length + 1),
-            pdf.exclusions.length ? `Wyłączenia: ${pdf.exclusions.join(' | ')}` : '']);
+          const path = await addToArchive(archive, base, out, startedAt);
+          pagesTotal += out.pages; bytesTotal += out.size; okDocs++;
+          rows.push([i + 1, where, item.label, cardRange(n), out.pages, path.slice(top.length + 1),
+            out.exclusions.length ? `Wyłączenia: ${out.exclusions.join(' | ')}` : '']);
         } catch (e) {
           if (e instanceof Fatal || e instanceof Aborted) throw e;
           log('błąd dokumentu', item.label, e);
@@ -1061,16 +1445,16 @@
       }
 
       ui.progress(plan.docs.length, plan.docs.length);
-      saveZip(part > 1 ? ` (część ${part})` : '');
+      await saveArchive(part > 1 ? ` (część ${part})` : '');
       const lines = [`Gotowe: ${okDocs} z ${plan.docs.length} dok., ${pagesTotal} str., ${fmtBytes(bytesTotal)}.`];
       lines.push(savedParts.length > 1 ? `Pliki: ${savedParts.join(', ')}` : `Plik: ${savedParts[0]}`);
       if (plan.bins.length) lines.push(`Nośniki (tylko w czytelni): ${plan.bins.length} – wpisane do spisu.`);
       ui.sayWithWarnings(lines.join('\n'), warnings);
     } catch (e) {
       log(e);
-      if (e instanceof Fatal && zip.count) {
+      if (e instanceof Fatal && archive.count) {
         rows.push(['', '', '', '', '', '', `PRZERWANO: ${describeError(e)}`]);
-        saveZip(' – NIEKOMPLETNE');
+        try { await saveArchive(' – NIEKOMPLETNE'); } catch (err) { log(err); }
         ui.sayWithWarnings(`Pobieranie przerwane. Zapisano to, co już było: ${savedParts.join(', ')}.`,
           [describeError(e), ...warnings]);
       } else {
@@ -1090,7 +1474,7 @@
     if (routeUrl('getPage') && routeUrl('getDocumentCards') && W.documentViewer && document.body) {
       clearInterval(waitTimer);
       createUi();
-      log('gotowe – panel pobierania dodany');
+      log('gotowe – przyciski pobierania dodane');
     } else if (tries > 240) {
       clearInterval(waitTimer);
     }

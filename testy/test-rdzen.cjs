@@ -113,12 +113,12 @@ run('magick', [base, '-alpha', 'set', '-channel', 'A', '-evaluate', 'set', '60%'
   // 4. ZIP
   const zip = new core.ZipBuilder();
   const when = new Date(2026, 10, 9, 14, 30, 22);
-  zip.add('PR 1 Ds. 123.2026/Tom I/012. Protokół przesłuchania świadka (k. 10-14).pdf',
+  await zip.add('PR 1 Ds. 123.2026/Tom I/012. Protokół przesłuchania świadka (k. 10-14).pdf',
     new Blob(out.chunks), out.size, out.crc, when);
-  zip.addBytes('PR 1 Ds. 123.2026/spis-dokumentow.csv',
+  await zip.addBytes('PR 1 Ds. 123.2026/spis-dokumentow.csv',
     new TextEncoder().encode(core.csv([['Lp.', 'Dokument'], [1, 'Zażółć; "gęślą" jaźń']])), when);
   const zipPath = path.join(work, 'test.zip');
-  fs.writeFileSync(zipPath, Buffer.from(await zip.finish().arrayBuffer()));
+  fs.writeFileSync(zipPath, Buffer.from(await (await zip.finish()).arrayBuffer()));
   const t = run('unzip', ['-t', zipPath]);
   ok(/No errors detected/.test(t), 'unzip -t: bez błędów');
   const unz = path.join(work, 'rozpakowane');
@@ -129,7 +129,45 @@ run('magick', [base, '-alpha', 'set', '-channel', 'A', '-evaluate', 'set', '60%'
   const csvText = fs.readFileSync(path.join(unz, 'PR 1 Ds. 123.2026', 'spis-dokumentow.csv'), 'utf8');
   ok(csvText.includes('"Zażółć; ""gęślą"" jaźń"'), 'CSV: cudzysłowy i średniki poprawnie ujęte');
 
-  // 5. Nazwy i plan kart
+  // 5. Pozostałe archiwa: ZIP z kompresją, TAR, TAR.GZ (długa polska ścieżka → nagłówek PAX)
+  const longName = 'PR 1 Ds. 123.2026/Wątek ogólny/Tom I (1)/006. Protokół przyjęcia ustnego zawiadomienia ' +
+    'o przestępstwie – bardzo długa nazwa (k. 8-14).pdf';
+  ok(Buffer.byteLength(longName) > 100, `długa ścieżka ma ${Buffer.byteLength(longName)} B (> 100 – wymaga PAX)`);
+  const pdfBytes = new Uint8Array(fs.readFileSync(pdfPath));
+  const textBytes = new TextEncoder().encode('Lp.;Dokument\r\n'.repeat(500));
+  const files = [[longName, pdfBytes], ['PR 1 Ds. 123.2026/spis.csv', textBytes],
+    ['PR 1 Ds. 123.2026/Tom I (1)/001. Zawiadomienie (k. 1-2)/k. 001v.png', fs.readFileSync(path.join(src, 'paleta-4bit.png'))]];
+  for (const [key, a] of Object.entries(core.ARCHIVES)) {
+    const ar = a.create();
+    for (const [name, bytes] of files) await ar.add(name, new Blob([bytes]), bytes.length, core.crc32(bytes), when);
+    const arPath = path.join(work, `test-${key}${a.ext}`);
+    fs.writeFileSync(arPath, Buffer.from(await (await ar.finish()).arrayBuffer()));
+    const outDir = path.join(work, `rozpakowane-${key}`);
+    fs.rmSync(outDir, { recursive: true, force: true });
+    fs.mkdirSync(outDir);
+    if (a.ext === '.zip') {
+      ok(/No errors detected/.test(run('unzip', ['-t', arPath])), `${key}: unzip -t bez błędów`);
+      run('unzip', ['-q', arPath, '-d', outDir]);
+      if (key === 'zip-deflate') {
+        const info = run('zipinfo', ['-v', arPath]);
+        ok(/compression method:\s+deflated/.test(info), `${key}: pliki dające się skompresować są skompresowane (Deflate)`);
+      }
+    } else {
+      const list = run('tar', [key === 'tar.gz' ? '-tzf' : '-tf', arPath]).trim().split('\n');
+      ok(JSON.stringify(list) === JSON.stringify(files.map((f) => f[0])), `${key}: tar -t pokazuje dokładne nazwy (UTF-8, PAX)`);
+      run('tar', [key === 'tar.gz' ? '-xzf' : '-xf', arPath, '-C', outDir]);
+      if (key === 'tar.gz') ok(execFileSync('gzip', ['-t', arPath]).length === 0, `${key}: gzip -t bez błędów`);
+    }
+    const same = files.every(([name, bytes]) => Buffer.compare(fs.readFileSync(path.join(outDir, name)), Buffer.from(bytes)) === 0);
+    ok(same, `${key}: rozpakowane pliki identyczne z wejściem (${fs.statSync(arPath).size} B)`);
+  }
+  // rekord PAX: długość liczy także swoje cyfry (np. 98 B treści → 101)
+  const rec = core.paxRecord('path', 'x'.repeat(91));
+  ok(Buffer.byteLength(rec) === Number(rec.split(' ')[0]), `paxRecord: długość ${rec.split(' ')[0]} zgodna`);
+  ok(core.pageFileName('k. 12', 0, 3, '.png') === 'k. 012.png' && core.pageFileName('k. 12v', 1, 3, '.png') === 'k. 012v.png' &&
+    core.pageFileName(null, 4, 3, '.jpg') === 'strona 005.jpg', 'pageFileName: k. 012.png / k. 012v.png / strona 005.jpg');
+
+  // 6. Nazwy i plan kart
   ok(core.safeName('a/b:c*?"<>|  d. ') === 'a_b_c______ d', `safeName: ${core.safeName('a/b:c*?"<>|  d. ')}`);
   ok(core.padIndex('5', 3) === '005' && core.padIndex('5.1', 3) === '005.1', 'padIndex');
   const fmt = (pp) => pp.map((p) => `${p.key}:${p.label}`).join(',');
