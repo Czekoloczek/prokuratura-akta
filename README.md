@@ -1,5 +1,8 @@
 # Portal Przeglądania Akt – pobieranie dokumentów
 
+> 🤖 **Vibecoded:** kod tego skryptu, testy i ten opis napisała sztuczna inteligencja –
+> **Claude Opus 5.5** (Anthropic) – na polecenie i pod kierunkiem autora.
+
 Nieoficjalny skrypt użytkownika (userscript) do
 [Portalu Przeglądania Akt](https://przegladanieakt.prokuratura.gov.pl) prokuratury.
 Portal pozwala zdigitalizowane akta tylko oglądać – skrypt dodaje do niego pobieranie:
@@ -117,8 +120,9 @@ i TAR.GZ kompresuje wtedy sama przeglądarka (bez wyboru poziomu). Kodek, który
 
 ## Uwagi prawne
 
-- W postępowaniu przygotowawczym sporządzanie kopii akt wymaga zgody prowadzącego
-  postępowanie (art. 156 § 5 KPK). Sprawdź, czy zarządzenie o udostępnieniu akt ją obejmuje.
+- W postępowaniu przygotowawczym o udostępnieniu akt i o sporządzaniu ich kopii decyduje
+  w zarządzeniu prowadzący postępowanie (art. 156 § 5 KPK). Pobranie akt skryptem to sporządzenie
+  kopii – sprawdź, czy zarządzenie o udostępnieniu akt obejmuje kopie, a nie tylko przeglądanie.
 - Publiczne rozpowszechnianie wiadomości z postępowania przygotowawczego, zanim zostały
   ujawnione w postępowaniu sądowym, jest przestępstwem (art. 241 § 1 KK).
 - Skrypt jest dostarczany „tak jak jest”, bez żadnej gwarancji. Za sposób korzystania
@@ -188,3 +192,7 @@ który nie startuje. Wymaga Node.js 22+, GNU tar, gzip, xz i unzip. Przycisków 
 używać, zmieniać i rozpowszechniać; jeśli rozpowszechniasz zmienioną wersję albo program,
 który go zawiera, musi on pozostać na GPL i z kodem źródłowym. Kodeki mają własne licencje
 (tabela wyżej), zgodne z GPL-3.0.
+
+---
+
+🤖 **Vibecoded** – kod, testy i dokumentację napisał Claude Opus 5.5 (Anthropic) na polecenie autora.
